@@ -1,0 +1,325 @@
+---
+title: "Preliminary Results"
+author: "Cameron Gallien"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r}
+library(tidyverse)
+library(tidytext)
+library(lubridate)
+library(textrecipes)
+library(tidymodels)
+library(SnowballC)
+library(stopwords)
+```
+
+```{r}
+review_data <- read.csv("project_data.csv", stringsAsFactors = F)
+review_data$sentiment <- factor(review_data$sentiment)
+```
+
+```{r}
+review_data <- review_data[!review_data$review==" ", ]
+review_data <- review_data[!review_data$review=="  ", ]
+
+review_data <- review_data[!grepl("^https://", review_data$review), ]
+review_data <- review_data[!grepl("^ https://", review_data$review), ]
+
+review_data <- review_data[!duplicated(review_data), ]
+
+review_data$processed_text <- str_replace_all(review_data$review,
+                                            "[^[:alnum:]]", " ")
+review_data$processed_text <- str_replace_all(review_data$processed_text, "[[:digit:]]", " ")
+review_data$processed_text <- str_to_lower(review_data$processed_text)
+```
+
+```{r}
+set.seed(47)
+review_split <- review_data %>%
+  select(processed_text, sentiment) %>%
+  initial_split()
+
+review_train <- training(review_split)
+review_test <- testing(review_split)
+```
+
+```{r}
+review_train %>%
+  tibble::rowid_to_column("id") %>%
+  unnest_tokens(output = word, input = processed_text) %>%
+  group_by(id) %>%
+  summarise(n_words = n()) %>%
+  ggplot(aes(n_words)) +
+  geom_bar() +
+  labs(x = "Number of Words per Review",
+       y = "Number of Reviews")
+```
+
+```{r}
+ngram_rec <- function(ngram_options) {
+  recipe(sentiment ~ processed_text, data = review_train) %>%
+    step_tokenize(processed_text, token = "ngrams", options = ngram_options) %>%
+    step_stopwords(processed_text, stopword_source = "snowball") %>%
+    step_stem(processed_text) %>%
+    step_tokenfilter(processed_text, max_tokens = 1000) %>%
+    step_tfidf(processed_text) %>%
+    step_normalize(all_predictors())
+}
+```
+
+```{r}
+ngram_wf <- workflow() %>%
+  add_model(nb_spec)
+
+fit_ngram <- function(ngram_options) {
+  fit_resamples(
+    ngram_wf %>% add_recipe(ngram_rec(ngram_options)),
+    review_folds,
+    control = control_resamples(save_pred = T)
+  )
+}
+```
+
+```{r}
+library(discrim)
+nb_spec <- naive_Bayes() %>%
+  set_mode("classification") %>%
+  set_engine("naivebayes")
+```
+
+```{r}
+set.seed(47)
+review_folds <- vfold_cv(review_train)
+
+```
+
+
+```{r}
+# set.seed(123)
+# unigram_rs <- fit_ngram(list(n=1))
+# 
+# set.seed(234)
+# bigram_rs <- fit_ngram(list(n=2, n_min=1))
+
+set.seed(345)
+trigram_rs <- fit_ngram(list(n=3, n_min=1))
+```
+
+
+```{r}
+collect_metrics(unigram_rs)
+collect_metrics(bigram_rs)
+collect_metrics(trigram_rs)
+```
+
+```{r}
+tri_rs_predictions <- collect_predictions(trigram_rs, newdata = review_test)
+collect_metrics(tri_rs_predictions)
+```
+
+```{r}
+tri_rs_roc <- tri_rs_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = sentiment, .pred_positive, event_level = 'second')
+tri_rs_roc %>% autoplot()
+```
+```{r}
+collect_metrics(tri_rs_roc)
+```
+
+<!-- # Exercises -->
+
+<!-- ## 1) Compare the mean accuracy and mean roc_auc of the naive Bayes model above to the null model. Section 7.2 of the ‘Supervised Machine Learning for Text Analysis in R’ textbook shows how to implement the null model for classification problems. -->
+
+<!-- ```{r} -->
+<!-- null_classification <- null_model() %>% -->
+<!--   set_engine("parsnip") %>% -->
+<!--   set_mode("classification") -->
+
+<!-- null_rs <- workflow() %>% -->
+<!--   add_recipe(news_rec) %>% -->
+<!--   add_model(null_classification) %>% -->
+<!--   fit_resamples(news_folds) -->
+
+<!-- null_rs %>% -->
+<!--   collect_metrics() -->
+<!-- ``` -->
+
+<!-- The null model was dramatically worse than the naive Bayes model that was created.  -->
+
+<!-- ## 2) Compare the mean accuracy and mean roc_auc of the naive Bayes model above to a lasso classification model. Section 7.3 of the ‘Supervised Machine Learning for Text Analysis in R’ textbook shows how to implement a lasso classification model. Note, hyperparameter tuning, as shown in section 7.4, does not need to be implemented. -->
+
+```{r}
+lasso_spec <- logistic_reg(penalty = .1, mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+```
+
+```{r}
+lasso_wf <- workflow() %>%
+  add_model(lasso_spec)
+```
+
+```{r}
+set.seed(47)
+fit_ngram <- function(ngram_options) {
+  fit_resamples(
+    lasso_wf %>% add_recipe(ngram_rec(ngram_options)),
+    review_folds
+  )
+}
+```
+
+```{r}
+trigram__lasso_rs <- fit_ngram(list(n=3, n_min=1))
+```
+
+```{r}
+collect_metrics(trigram__lasso_rs)
+```
+
+
+```{r}
+lasso_rs_metrics <- collect_metrics(lasso_rs)
+lasso_rs_predictions <- collect_predictions(lasso_rs)
+lasso_rs_metrics
+```
+
+The lasso classification model performed far better than the naive Bayes model.
+```{r}
+lasso_rs_roc <- lasso_rs_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = sentiment, .pred_positive, event_level = 'second')
+lasso_rs_roc %>% autoplot()
+```
+
+```{r}
+tune_spec <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+lambda_grid <- grid_regular(penalty(), levels = 30)
+
+tune_wf <- workflow() %>%
+  add_model(tune_spec)
+
+set.seed(47)
+tune_rs <- tune_grid(
+  tune_wf,
+  review_folds,
+  grid = lambda_grid,
+  control = control_resamples(save_pred = TRUE)
+)
+
+tune_rs %>%
+  show_best("roc_auc")
+```
+
+
+```{r}
+fit_ngram_lasso <- function(ngram_options) {
+  fit_resamples(
+    tune_wf %>% add_recipe(ngram_rec(ngram_options)),
+    review_folds,
+    grid = lambda_grid,
+    control = control_resamples(save_pred = T)
+  )
+}
+```
+
+```{r}
+set.seed(345)
+trigram_tune_rs <- fit_ngram_lasso(list(n=3, n_min=1))
+
+trigram_tune_rs %>%
+  show_best("roc_auc")
+```
+
+
+```{r}
+chosen_auc <- tune_rs %>%
+  select_by_one_std_err(metric = "roc_auc", -penalty)
+final_lasso <- finalize_workflow(tune_wf, chosen_auc)
+fitted_lasso <- fit(final_lasso, review_train)
+```
+
+
+```{r}
+fit_lasso_metrics <- collect_metrics(fitted_lasso)
+fit_lasso_predictions <- collect_predictions(fitted_lasso)
+fit_lasso_metrics
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
